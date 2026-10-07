@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Merchant Fee Automation</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">RECONCILIATION WORKSPACE</p>
+        <h1>Merchant Fee Automation</h1>
+        <p class="subtitle">Shopify Payments · PayPal · Afterpay</p>
+      </div>
+      <button class="button secondary" id="openSop" type="button">View SOP</button>
+    </header>
+
+    <section class="status-strip" aria-live="polite">
+      <div>
+        <strong id="uploadCount">0 / 5 files ready</strong>
+        <span id="statusText">Upload the required reports to begin.</span>
+      </div>
+      <div class="progress-track"><span id="progressBar"></span></div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>Source reports</h2>
+          <p>Files are validated by their columns, not by filename.</p>
+        </div>
+        <button class="text-button" id="clearAll" type="button">Clear all</button>
+      </div>
+      <div class="upload-grid" id="uploadGrid"></div>
+      <div class="file-meta" style="margin-top:14px">Use <strong>Map columns</strong> on any uploaded report if its headers are different from those expected. Select which source column represents each required field, then apply and process.</div>
+    </section>
+
+
+    <section class="panel">
+      <div class="section-head"><div><h2>PayPal file-only processing</h2>
+        <p>The five standard source files are sufficient for merchant-fee calculation and reconciliation. The PayPal detail sheet keeps the existing columns. Original-currency fields are populated only when a source reference can be matched exactly; otherwise they remain blank rather than being guessed.</p></div></div>
+      <p class="file-meta">No API, extra mapping file, or manual transaction matching is required to process and download the report.</p>
+    </section>
+
+    <section class="panel controls-panel">
+      <div>
+        <h2>Processing range</h2>
+        <p>Optional. Leave blank to use the common date range detected from the reports.</p>
+      </div>
+      <div class="date-controls">
+        <label>From <input type="date" id="fromDate" /></label>
+        <label>To <input type="date" id="toDate" /></label>
+      </div>
+      <div class="date-controls order-range-controls">
+        <label>From Order ID <input id="orderFrom" type="text" inputmode="numeric" placeholder="#10053 (optional)" /></label>
+        <label>To Order ID <input id="orderTo" type="text" inputmode="numeric" placeholder="#10342 (optional)" /></label>
+      </div>
+      <p class="file-meta">Optional order range: the engine allocates fees across the full period first, validates full-period totals, then exports only orders in the selected range.</p>
+      <div class="fx-test-row">
+        <button class="button secondary" id="testFxBtn" type="button">Check FX API</button>
+        <span id="fxTestStatus" role="status" aria-live="polite" class="file-meta"></span>
+      </div>
+      <button class="button primary" id="processBtn" type="button" disabled>Process Merchant Fees</button>
+    </section>
+
+    <section class="panel hidden" id="resultsPanel">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">PROCESSING RESULTS</p>
+          <h2>Internal reconciliation</h2>
+          <p id="rangeLabel"></p>
+        </div>
+      </div>
+      <div class="metrics" id="metrics"></div>
+      <div class="file-meta" id="internalStatus">Gross amounts are reconciled to Shopify Net Payments; independent external verification is not required.</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Gateway</th><th>Calculated gross</th><th>Net Payments total</th><th>Difference</th><th>Status</th></tr></thead>
+          <tbody id="reconRows"></tbody>
+        </table>
+      </div>
+      <section class="review-panel" aria-label="Review issues">
+        <h3>Review issues — downloads are not blocked</h3>
+        <p class="file-meta" id="reviewCount">0 items need review</p>
+        <p class="file-meta">Review items are excluded, unresolved, or unmatched source records. Exported amounts must not be treated as approved until these are resolved.</p>
+        <div class="table-wrap"><table><thead><tr><th>Issue</th><th>Gateway</th><th>Date</th><th>Reference</th><th>Details</th></tr></thead><tbody id="reviewRows"></tbody></table></div>
+      </section>
+      <div id="warnings" class="warnings hidden"></div>
+      <div class="download-row">
+        <button class="button primary" id="downloadMerchant" type="button">Download Merchant Fee Report</button>
+        <button class="button secondary" id="downloadGateway" type="button">Download Payment Gateway Summary</button>
+        <button class="button secondary" id="downloadJournal" type="button">Download Manual Journal (Xero)</button>
+        <button class="button secondary" id="downloadRoundingAudit" type="button">Download Rounding Audit</button>
+        <button class="button secondary" id="downloadPaypalFxFee" type="button">Download PayPal FX Fee Audit</button>
+        <button class="button secondary" id="downloadReview" type="button">Download Review Issues CSV</button>
+        <button class="button secondary" id="downloadFxAudit" type="button">Download FX Audit</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="mappingDialog" class="mapping-dialog">
+    <div class="dialog-head"><div><h2 id="mappingTitle">Map source columns</h2><p class="file-meta">Match the actual CSV headers to the fields used in calculations. Column examples update when you choose a source.</p></div><button type="button" id="closeMapping" class="icon-button" aria-label="Close column mapping">×</button></div>
+    <div id="mappingRows" class="mapping-rows"></div>
+    <p id="mappingStatus" class="file-meta" role="status"></p>
+    <div class="mapping-actions"><button type="button" id="applyMapping" class="button primary">Apply mapping</button><button type="button" id="cancelMapping" class="button secondary">Cancel</button></div>
+  </dialog>
+
+  <dialog id="sopDialog" class="sop-dialog">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow">ORIGINAL SOP</p>
+        <h2>Merchant Fees Preparation and Updation</h2>
+        <p class="dialog-subtitle">The complete original 19-page SOP is embedded below, including its screenshots and instructions.</p>
+      </div>
+      <button class="icon-button" id="closeSop" aria-label="Close SOP">×</button>
+    </div>
+    <div class="sop-document-wrap">
+      <iframe
+        class="sop-frame"
+        src="docs/Merchant%20fees%20Preparation%20and%20Updation.pdf#view=FitH"
+        title="Original Merchant Fees Preparation and Updation SOP">
+      </iframe>
+      <div class="sop-fallback">
+        <p>If the document preview is not supported by your browser, open the original SOP using one of the buttons below.</p>
+        <div class="sop-link-row">
+          <a class="button secondary link-button" href="docs/Merchant%20fees%20Preparation%20and%20Updation.pdf" target="_blank" rel="noopener">Open SOP PDF</a>
+          <a class="button secondary link-button" href="docs/Merchant%20fees%20Preparation%20and%20Updation.docx" target="_blank" rel="noopener">Open Original Word SOP</a>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="libs/jszip.min.js"></script>
+  <script src="js/file-parser.js"></script>
+  <script src="js/validation.js"></script>
+  <script src="js/merchant-engine.js"></script>
+  <script src="js/exporter.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
