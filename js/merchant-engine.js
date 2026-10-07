@@ -44,7 +44,8 @@
       const refund=P.cleanNumber(r['Refunded payments']);
       const net=P.cleanNumber(r['Net payments']);
       const key=`${day}|${kind}|${order}`;
-      const q=map.get(key)||{day,kind,gateway,order,gross:0,refund:0,net:0,sourceRows:0,transactionIds:[]};
+      const q=map.get(key)||{day,kind,gateway,order,gross:0,refund:0,net:0,sourceRows:0,transactionIds:[],country:''};
+      if(!q.country)q.country=String(r['Billing country']||'').trim();
       q.gross+=gross; q.refund+=refund; q.net+=net; q.sourceRows++;
       const sourceTxn=String(r['Transaction ID']||'').trim();if(sourceTxn&&!q.transactionIds.includes(sourceTxn))q.transactionIds.push(sourceTxn);
       map.set(key,q);
@@ -127,21 +128,38 @@
   // Most recent publication on/before the transaction date is used on weekends.
   const FX_BASE='https://api.frankfurter.dev/v2/providers/ecb/rates';
   function isoBack(day,offset){const d=new Date(day+'T00:00:00Z');d.setUTCDate(d.getUTCDate()-offset);return d.toISOString().slice(0,10);}
-  function makeFX(allCurrencies,warnings){
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  // One request, with a timeout. Retries transient failures (network, timeout, 429, 5xx)
+  // with backoff so a brief blip does not abort a whole processing run.
+  async function fetchJsonWithRetry(url,day,attempts){
+    let lastErr;
+    for(let i=0;i<attempts;i++){
+      if(i)await sleep(800*2**(i-1));
+      const controller=typeof AbortController!=='undefined'?new AbortController():null;
+      const timer=controller?setTimeout(()=>controller.abort(),12000):null;
+      let resp;
+      try{resp=await fetch(url,{headers:{Accept:'application/json'},cache:'default',...(controller?{signal:controller.signal}:{})});}
+      catch(e){
+        lastErr=new Error(`FX API network failure/timeout for ${day}: ${e&&e.name==='AbortError'?'request timed out':(e&&e.message)||e}. Check internet connection and browser access to Frankfurter.`);
+        continue;
+      }finally{if(timer)clearTimeout(timer);}
+      if(resp.ok)return await resp.json();
+      let note='';try{note=(await resp.text()).slice(0,160);}catch(_){}
+      lastErr=new Error(`FX API returned HTTP ${resp.status} for ${day}. ${note}`);
+      if(resp.status<500&&resp.status!==429)throw lastErr; // a 4xx will not fix itself
+    }
+    throw lastErr;
+  }
+  // Shared across runs: the startup FX check, and processing, reuse the same answers.
+  const RATE_CACHE=new Map();
+  function makeFX(allCurrencies,warnings,attempts=3){
     const needed=[...new Set([...allCurrencies,'AUD'].map(x=>String(x||'').toUpperCase()).filter(x=>/^[A-Z]{3}$/.test(x)&&x!=='EUR'))].sort();
-    const requested=new Map(),used=new Map();
+    const used=new Map();
     async function dailyRates(day){
-      if(requested.has(day))return requested.get(day);
+      const url=`${FX_BASE}?date=${encodeURIComponent(day)}&base=EUR&quotes=${encodeURIComponent(needed.join(','))}`;
+      if(RATE_CACHE.has(url))return RATE_CACHE.get(url);
       const task=(async()=>{
-        const url=`${FX_BASE}?date=${encodeURIComponent(day)}&base=EUR&quotes=${encodeURIComponent(needed.join(','))}`;
-        let resp;
-        const controller=typeof AbortController!=='undefined'?new AbortController():null;
-        const timer=controller?setTimeout(()=>controller.abort(),12000):null;
-        try{resp=await fetch(url,{headers:{Accept:'application/json'},cache:'default',...(controller?{signal:controller.signal}:{})});}
-        catch(e){throw new Error(`FX API network failure/timeout for ${day}: ${e.message||e}. Check internet connection and browser access to Frankfurter.`);}
-        finally{if(timer)clearTimeout(timer);}
-        if(!resp.ok){let note='';try{note=(await resp.text()).slice(0,160);}catch(_){}throw new Error(`FX API returned HTTP ${resp.status} for ${day}. ${note}`);}
-        const records=await resp.json();
+        const records=await fetchJsonWithRetry(url,day,attempts);
         if(!Array.isArray(records))throw new Error(`Unexpected FX API response on ${day}: ECB historical rates array required.`);
         const map={};
         for(const r of records){
@@ -152,7 +170,10 @@
           }
         }
         return map;
-      })();requested.set(day,task);return task;
+      })();
+      RATE_CACHE.set(url,task);
+      task.catch(()=>{if(RATE_CACHE.get(url)===task)RATE_CACHE.delete(url);}); // never cache a failure
+      return task;
     }
     async function getRate(day,currency){
       const cur=String(currency||'').toUpperCase();
@@ -186,13 +207,15 @@
   // depending on checkout integration. In particular, Express Checkout Payment
   // is a normal merchant sale and must NOT be excluded. Exclude reserve,
   // withdrawal and currency-conversion activity, even if they have a fee.
+  const ppKey=v=>String(v||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
   function paypalFeeTransaction(row){
-    const kind=String(row['Type']||'').trim().toLowerCase().replace(/\s+/g,' ');
+    const kind=ppKey(row['Type']);
     const status=String(row['Status']||'').trim().toLowerCase();
     if(status && !['completed','refunded','partially refunded'].includes(status))return false;
-    return kind==='express checkout payment' ||
-      kind==='pre-approved payment bill user payment' ||
-      kind==='payment refund';
+    // Spacing/hyphen-insensitive: PayPal exports both "Pre-approved" and "PreApproved".
+    return kind==='expresscheckoutpayment' ||
+      kind==='preapprovedpaymentbilluserpayment' ||
+      kind==='paymentrefund';
   }
 
   async function paypalSource(rows,from,to,warnings,fx){
@@ -207,6 +230,13 @@
       }
       return eligible;
     });
+    const lossTypes=new Map();
+    for(const r of rows){
+      if(!inRange(P.parseDate(r['Date']),from,to))continue;
+      const kind=String(r['Type']||'').trim();
+      if(/chargeback|dispute|reversal/i.test(kind)){const k=`${kind} ${String(r['Currency']||'').toUpperCase()}`,q=lossTypes.get(k)||{n:0,sum:0};q.n++;q.sum+=P.cleanNumber(r['Gross']);lossTypes.set(k,q);}
+    }
+    if(lossTypes.size)warnings.push('PayPal chargeback/dispute activity is NOT part of the merchant-fee allocation and needs separate journaling: '+[...lossTypes].map(([k,q])=>`${k}: ${q.n} row(s), ${P.round2(q.sum)}`).join('; ')+'.');
     if(excludedFeeTypes.size){
       warnings.push('PayPal excluded non-sales transaction types carrying fees: '+
         [...excludedFeeTypes].map(([kind,count])=>`${kind} (${count})`).join(', ')+
@@ -225,7 +255,7 @@
       // Merchant-fee reporting uses the opposite sign: sale fee positive, refund fee negative.
       const feeAUD=(-sourceFee)*rate;
       const type=originalGross<0?'Refund':'Sale';
-      txns.push({day,currency:cur,originalGross,grossAUD,feeAUD,type,rate,rateDate,rateSource,transactionId:String(r['Transaction ID']||''),referenceTxnId:String(r['Reference Txn ID']||''),invoiceNumber:String(r['Invoice Number']||''),customNumber:String(r['Custom Number']||''),receiptId:String(r['Receipt ID']||'')});
+      txns.push({day,currency:cur,originalGross,grossAUD,feeAUD,type,rate,rateDate,rateSource,transactionId:String(r['Transaction ID']||''),referenceTxnId:String(r['Reference Txn ID']||''),invoiceNumber:String(r['Invoice Number']||''),customNumber:String(r['Custom Number']||''),receiptId:String(r['Receipt ID']||''),country:String(r['Country']||'').trim()});
       const q=pool[day]||(pool[day]={fee:0,gross:0,sourceRows:0}); q.fee+=feeAUD;q.gross+=grossAUD;q.sourceRows++;
       const key=`${day}|${cur}|${rateDate}|${rateSource}`;
       const audit=byCurrency[key]||(byCurrency[key]={day,currency:cur,rateDate,rate,rateSource,sourceRows:0,feeOriginal:0,feeAUD:0,grossOriginal:0,grossAUD:0});
@@ -315,63 +345,190 @@
 
   // File-only PayPal metadata attribution. The five required reports do not
   // always expose a common Shopify OrderID <-> PayPal Transaction ID. We only
-  // populate original-currency fields when an exact source identifier proves
-  // the relationship. Date/amount/country proximity is intentionally never used.
-  function matchPaypalMeta(orderRows,sourceTxns,master,warnings){
+  // populate original-currency fields when an identifier in the files proves the
+  // relationship. Date/amount/country proximity is intentionally never used.
+  //
+  // Proof, strongest first:
+  //  1) A PayPal Invoice/Custom Number that equals a Shopify PayPal order name, or
+  //     contains exactly that order number as a stand-alone digit run
+  //     ("#10053", "10053", "SHOP-10053", "#10053-1"). The order must exist in the
+  //     Net Payments file, so a random number can never create a match.
+  //  2) Exact equality with a Transaction ID carried by the Net Payments file.
+  //  3) A refund/adjustment whose Reference Txn ID points at an already-proven payment.
+  // Matching is per order AND per day; a +/-1 day tolerance is used only for
+  // transactions that are not claimed by an exact-day row (PayPal vs store time zone).
+  function matchPaypalMeta(orderRows,sourceTxns,master,warnings,opts){
     const normOrder=x=>{const s=String(x||'').trim().replace(/^#/,'');return s?'#'+s:'';};
-    const orderByTxn=new Map();
+    const paypalOrders=new Set(),byDigits=new Map(),orderByTxn=new Map();
     for(const o of master.orders||[]){
       if(o.kind!=='paypal')continue;
+      const name=normOrder(o.order);paypalOrders.add(name);
+      const d=name.slice(1);if(/^\d+$/.test(d)){const k=String(Number(d));if(!byDigits.has(k))byDigits.set(k,new Set());byDigits.get(k).add(name);}
       for(const id of o.transactionIds||[]){
         const key=String(id||'').trim();if(!key)continue;
-        if(!orderByTxn.has(key))orderByTxn.set(key,new Set());orderByTxn.get(key).add(normOrder(o.order));
+        if(!orderByTxn.has(key))orderByTxn.set(key,new Set());orderByTxn.get(key).add(name);
       }
     }
-    const direct=new Map();
-    const add=(order,tx)=>{if(!order||!tx)return;if(!direct.has(order))direct.set(order,[]);direct.get(order).push(tx);};
-    for(const tx of sourceTxns){
-      // 1) PayPal fields that literally contain a Shopify order number.
-      for(const ref of [tx.invoiceNumber,tx.customNumber]){
-        const str=String(ref||'').trim();
-        if(/^#?\d{4,}$/.test(str))add(normOrder(str),tx);
+    const resolve=new Map();          // transactionId(or index) -> order
+    const stat={invoice:0,custom:0,fieldsSeen:{invoice:0,custom:0,reference:0}};
+    const ownersOf=(tx)=>{
+      const found=new Set();
+      for(const [field,ref] of [['invoice',tx.invoiceNumber],['custom',tx.customNumber]]){
+        const str=String(ref||'').trim();if(!str)continue;stat.fieldsSeen[field]++;
+        const direct=normOrder(str);if(paypalOrders.has(direct))found.add(direct);
+        for(const run of str.match(/\d{3,}/g)||[]){const hit=byDigits.get(String(Number(run)));if(hit)hit.forEach(n=>found.add(n));}
       }
-      // 2) Exact reference equality with Shopify Net Payments Transaction ID.
-      // This is safe when a future export exposes the same gateway reference.
       for(const ref of [tx.transactionId,tx.referenceTxnId,tx.invoiceNumber,tx.customNumber,tx.receiptId]){
         const key=String(ref||'').trim();if(!key)continue;
-        const owners=orderByTxn.get(key);if(!owners||owners.size!==1)continue;
-        add([...owners][0],tx);
+        const owners=orderByTxn.get(key);if(owners)owners.forEach(n=>found.add(n));
       }
+      return found;
+    };
+    const orderOf=new Map(),ambiguousTx=new Set();
+    sourceTxns.forEach((tx,i)=>{
+      if(tx.referenceTxnId)stat.fieldsSeen.reference++;
+      const f=ownersOf(tx);
+      if(f.size===1)orderOf.set(i,[...f][0]);else if(f.size>1)ambiguousTx.add(i);
+    });
+    // 3) refunds etc. inherit the order of the payment they reference.
+    const idxByTxnId=new Map();sourceTxns.forEach((tx,i)=>{if(tx.transactionId)idxByTxnId.set(tx.transactionId,i);});
+    for(let pass=0;pass<3;pass++){
+      sourceTxns.forEach((tx,i)=>{
+        if(orderOf.has(i)||ambiguousTx.has(i)||!tx.referenceTxnId)return;
+        const j=idxByTxnId.get(tx.referenceTxnId);
+        if(j!==undefined&&orderOf.has(j))orderOf.set(i,orderOf.get(j));
+      });
     }
-    let matched=0,unavailable=0,ambiguous=0;
+    const dayShift=(day,n)=>{const d=new Date(day+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
+    const byOrderDay=new Map(),byOrder=new Map();
+    orderOf.forEach((order,i)=>{
+      const tx=sourceTxns[i],k=`${order}|${tx.day}`;
+      if(!byOrderDay.has(k))byOrderDay.set(k,[]);byOrderDay.get(k).push(i);
+      if(!byOrder.has(order))byOrder.set(order,[]);byOrder.get(order).push(i);
+    });
+    const claimed=new Set(),assigned=new Map();
+    for(const row of orderRows){const k=`${normOrder(row.OrderID)}|${row.Date}`;const ids=byOrderDay.get(k);if(ids){assigned.set(row,ids);ids.forEach(i=>claimed.add(i));}}
     for(const row of orderRows){
-      const candidates=[...new Set(direct.get(normOrder(row.OrderID))||[])];
+      if(assigned.has(row))continue;
+      const o=normOrder(row.OrderID),ids=(byOrder.get(o)||[]).filter(i=>!claimed.has(i)&&[-1,1].some(n=>dayShift(row.Date,n)===sourceTxns[i].day));
+      if(ids.length){assigned.set(row,ids);ids.forEach(i=>claimed.add(i));}
+    }
+    const audit=[];let byId=0,byInfer=0,byCur=0,ambiguous=0,none=0,over=0;
+    const used=new Set(claimed);
+    const setRow=(row,cands,basis,note)=>{
+      const currencies=[...new Set(cands.map(t=>t.currency))];
+      row.OriginalCurrency=currencies[0];
+      row.GrossOriginalCurrency=P.round2(cands.reduce((sum,t)=>sum+Number(t.originalGross||0),0));
+      const types=[...new Set(cands.map(t=>t.type))];
+      row.Type=types.length===1?types[0]:'Mixed Sale/Refund';
+      audit.push({date:row.Date,order:row.OrderID,country:row._o?.country||'',grossAUD:row._o?.gross||0,refundAUD:row._o?.refund||0,basis,currency:row.OriginalCurrency,grossOriginal:row.GrossOriginalCurrency,note:note||''});
+    };
+    const unresolved=[];
+    for(const row of orderRows){
+      const ids=assigned.get(row)||[],candidates=ids.map(i=>sourceTxns[i]);
       const currencies=[...new Set(candidates.map(t=>t.currency))];
-      if(candidates.length&&currencies.length===1){
-        row.OriginalCurrency=currencies[0];
-        row.GrossOriginalCurrency=P.round2(candidates.reduce((sum,t)=>sum+Number(t.originalGross||0),0));
-        const types=[...new Set(candidates.map(t=>t.type))];
-        row.Type=types.length===1?types[0]:'Mixed Sale/Refund';matched++;
-      }else{
+      if(candidates.length&&currencies.length===1){setRow(row,candidates,'Exact identifier','');byId++;}
+      else{
         row.OriginalCurrency='';row.GrossOriginalCurrency='';
         row.Type=row.GrossAmountAUD<0?'Refund':'Sale';
-        if(candidates.length)ambiguous++;else unavailable++;
+        unresolved.push(row);
       }
     }
-    if(unavailable||ambiguous){
-      warnings.push(`PayPal source attribution: ${matched} order(s) had an exact file-based transaction reference. ${unavailable} order(s) had no common transaction identifier in the supplied files${ambiguous?`, and ${ambiguous} were ambiguous`:''}. Their OriginalCurrency and GrossOriginalCurrency cells are intentionally blank; AUD gross, fee and net calculations remain source-reconciled.`);
+    // ---- Evidence-based inference for rows with no identifier -------------------
+    // The PayPal Activity report usually carries only a checkout-session id, not the
+    // Shopify order number. A row is filled ONLY when every still-unclaimed PayPal
+    // payment that fits the order (same day +/-1, same sign, same billing country
+    // when both are known, and an amount that converts to the order's AUD value at
+    // the rate band Shopify itself used for that currency) shows the SAME currency
+    // and the SAME original amount. If two different currencies fit, e.g. AUD 64.99
+    // vs USD 47.00, the row stays blank rather than risk a wrong value.
+    const infer=opts&&opts.infer!==false;
+    const bandFor=(cur,day)=>{let lo=Infinity,hi=-Infinity;for(const k of [-1,0,1]){const b=opts&&opts.bands&&opts.bands.get(`${cur}|${dayShift(day,k)}`);if(b){lo=Math.min(lo,b[0]);hi=Math.max(hi,b[1]);}}return hi>0?[lo*0.99,hi*1.01,'Shopify rate']:null;};
+    const fits=(t,amount,kind,country,day)=>{
+      const g=Number(t.originalGross)||0;if((g>0)!==(kind==='sale'))return false;
+      if(country&&t.country&&t.country.toLowerCase()!==country.toLowerCase())return false;
+      const x=Math.abs(g);if(t.currency==='AUD')return Math.abs(x-amount)<0.0051;
+      const band=bandFor(t.currency,day)||[t.rate*0.96,t.rate*1.04];
+      return x*band[0]-0.011<=amount&&amount<=x*band[1]+0.011;
+    };
+    for(const row of unresolved){
+      if(!infer||!row._o){none++;audit.push({date:row.Date,order:row.OrderID,country:row._o?.country||'',grossAUD:row._o?.gross||0,refundAUD:row._o?.refund||0,basis:'Not linked',currency:'',grossOriginal:'',note:'Inference disabled or no data'});continue;}
+      const comps=[];if(row._o.gross>0)comps.push(['sale',row._o.gross]);if(row._o.refund<0)comps.push(['refund',-row._o.refund]);
+      const picked=[];let reason='';
+      for(const [kind,amount] of comps){
+        // Unanimity is judged on EVERY payment that fits (used or not, +/-1 day), so
+        // another order having already claimed the true payment can never make a
+        // wrong neighbour look unique. Only then is an unused payment consumed.
+        const all=sourceTxns.map((t,i)=>[t,i]).filter(([t])=>Math.abs((new Date(t.day)-new Date(row.Date))/864e5)<=1&&fits(t,amount,kind,row._o.country,row.Date));
+        if(!all.length){reason='No PayPal payment fits this day/amount/country';break;}
+        const classes=[...new Set(all.map(([t])=>`${t.currency}|${Math.abs(t.originalGross).toFixed(2)}`))];
+        if(classes.length>1){
+          const curs=[...new Set(all.map(([t])=>t.currency))];
+          if(curs.length===1){picked.push({partial:curs[0]});continue;} // same currency, original amount unknown
+          reason=`Ambiguous: ${classes.map(c=>c.replace('|',' ')).join(' or ')} all fit`;break;
+        }
+        const cand=all.filter(([,i])=>!used.has(i));
+        if(!cand.length){reason='Matching PayPal payments already used by other orders';break;}
+        picked.push(cand.sort((x,y)=>Math.abs(new Date(x[0].day)-new Date(row.Date))-Math.abs(new Date(y[0].day)-new Date(row.Date)))[0]);
+      }
+      const cur=new Set(picked.map(x=>Array.isArray(x)?x[0].currency:x.partial));
+      const partial=picked.some(x=>!Array.isArray(x));
+      if(!reason&&picked.length===comps.length&&comps.length&&cur.size===1&&!partial){
+        picked.forEach(([,i])=>used.add(i));
+        setRow(row,picked.map(([t])=>t),'Unique match: day + amount + country','');byInfer++;
+      }else if(!reason&&picked.length===comps.length&&comps.length&&cur.size===1){
+        row.OriginalCurrency=[...cur][0];row.GrossOriginalCurrency='';
+        audit.push({date:row.Date,order:row.OrderID,country:row._o.country||'',grossAUD:row._o.gross,refundAUD:row._o.refund,basis:'Currency only',currency:row.OriginalCurrency,grossOriginal:'',note:'Same currency fits, but more than one original amount fits'});byCur++;
+      }else{
+        if(!reason&&cur.size>1)reason='Sale and refund in different currencies';
+        if(/Ambiguous/.test(reason))ambiguous++;else if(/already used/.test(reason))over++;else none++;
+        audit.push({date:row.Date,order:row.OrderID,country:row._o.country||'',grossAUD:row._o.gross,refundAUD:row._o.refund,basis:'Not linked',currency:'',grossOriginal:'',note:reason||'No candidates'});
+      }
+    }
+    orderRows.linkAudit=audit;
+    const blank=ambiguous+none+over;
+    if(blank||byInfer){
+      const parts=[`${byId} by exact identifier`,`${byInfer} by unique day/amount/country match`,...(byCur?[`${byCur} currency only — original amount ambiguous`]:[])];
+      warnings.push(`PayPal original currency: ${orderRows.length-blank} of ${orderRows.length} PayPal order row(s) have an original currency (${parts.join(', ')}). ${blank?`${blank} left blank (${ambiguous} ambiguous, ${none} no matching PayPal payment, ${over} payments already used) — see the PayPal Currency Link Audit. `:''}Rows without an exact identifier are inferred from day, amount and country (the PayPal export normally carries a checkout-session id, not the Shopify order number), not proven by an id; AUD gross, fee and net are unaffected either way.`);
     }
   }
 
-  function buildPaypalDetails(master,paypal,from,to,warnings,roundingAudit){
+
+  // Shopify applies one conversion rate per presentment currency per day to every
+  // order, whatever the gateway. Its Payment Transactions report exposes it
+  // (Amount in AUD vs Presentment Amount), which gives a tight band for matching
+  // PayPal foreign-currency payments to AUD orders.
+  function shopifyRateBands(rows,master){
+    const bands=new Map(),audGross=new Map(),charges=new Map();
+    for(const o of master.orders)if(o.kind==='shopify')audGross.set(o.order,(audGross.get(o.order)||0)+o.gross);
+    for(const r of rows||[])if(String(r['Type']||'').trim().toLowerCase()==='charge'){const o=String(r['Order']||'').trim();charges.set(o,(charges.get(o)||0)+1);}
+    for(const r of rows||[]){
+      if(String(r['Type']||'').trim().toLowerCase()!=='charge')continue;
+      const pc=String(r['Presentment Currency']||'').trim().toUpperCase(),pa=P.cleanNumber(r['Presentment Amount']);
+      if(!/^[A-Z]{3}$/.test(pc)||pc==='AUD'||!(pa>0))continue;
+      const cur=String(r['Currency']||'AUD').trim().toUpperCase(),order=String(r['Order']||'').trim(),d=P.parseDate(r['Transaction Date']);
+      if(!d)continue;
+      // AUD-settled rows give the rate directly; for rows settled in the presentment
+      // currency (e.g. USD) the order's AUD value in Net Payments gives it.
+      let ratio=0;
+      if(cur==='AUD')ratio=P.cleanNumber(r['Amount'])/pa;
+      else if(cur===pc&&charges.get(order)===1&&audGross.get(order)>0)ratio=audGross.get(order)/pa;
+      if(!(ratio>0))continue;
+      const k=`${pc}|${P.dateKey(d)}`,b=bands.get(k);
+      if(b){b[0]=Math.min(b[0],ratio);b[1]=Math.max(b[1],ratio);}else bands.set(k,[ratio,ratio]);
+    }
+    return bands;
+  }
+
+  function buildPaypalDetails(master,paypal,from,to,warnings,roundingAudit,opts){
     const byDay=ordersByDay(master,'paypal',from,to), out=[];
     Object.keys(byDay).sort().forEach(day=>{
       const rows=byDay[day], p=paypal.pool[day]||{fee:0};
       rows.forEach(r=>r.GrossAmountAUD=P.round2(r.net));
       allocateRounded(rows,p.fee,'net','FeeAmountAUD',Object.assign(roundingAudit,{gateway:'PayPal'}));
-      rows.forEach(r=>{r.NetAmountAUD=P.round2(r.GrossAmountAUD-r.FeeAmountAUD);out.push({Date:day,OrderID:r.order,OriginalCurrency:'',GrossOriginalCurrency:'',GrossAmountAUD:r.GrossAmountAUD,FeeAmountAUD:r.FeeAmountAUD,NetAmountAUD:r.NetAmountAUD,Type:r.GrossAmountAUD<0?'Refund':'Sale'});});
+      rows.forEach(r=>{r.NetAmountAUD=P.round2(r.GrossAmountAUD-r.FeeAmountAUD);const row={Date:day,OrderID:r.order,OriginalCurrency:'',GrossOriginalCurrency:'',GrossAmountAUD:r.GrossAmountAUD,FeeAmountAUD:r.FeeAmountAUD,NetAmountAUD:r.NetAmountAUD,Type:r.GrossAmountAUD<0?'Refund':'Sale'};Object.defineProperty(row,'_o',{value:{gross:r.gross,refund:r.refund,country:r.country||''},enumerable:false});out.push(row);});
     });
-    matchPaypalMeta(out,paypal.txns,master,warnings);
+    matchPaypalMeta(out,paypal.txns,master,warnings,opts);
     return out;
   }
 
@@ -465,9 +622,10 @@
     const roundingAudit=[];
     const details={
       afterpay:buildAfterpayDetails(master,afterPool,range.from,range.to,roundingAudit),
-      paypal:buildPaypalDetails(master,paypal,range.from,range.to,warnings,roundingAudit),
+      paypal:buildPaypalDetails(master,paypal,range.from,range.to,warnings,roundingAudit,{infer:range.inferCurrency!==false,bands:shopifyRateBands(files.transactions.rows,master)}),
       shopify:buildShopifyDetails(master,shopPool,range.from,range.to,roundingAudit)
     };
+    const paypalLinkAudit=details.paypal.linkAudit||[];
     const fxAudit=fx.summary();
     const sections=summaryFromDetails(details);
     const summary=gatewaySummary(master);
@@ -506,7 +664,7 @@
       warnings.push('Order-range mode: fee allocation and source/checkpoint checks were performed on the entire date period BEFORE selecting order IDs. Downloaded merchant and gateway files contain only the chosen subset. Subset fees intentionally do not equal the full gateway fee pool.');
     }
     if(review.length)warnings.push(`${review.filter(x=>x.severity==='REVIEW').length} review item(s) identified. Downloads remain available; REVIEW means not approved for journal posting.`);
-    return {details:resultDetails,sections:resultSections,summary:resultSummary,reconciliation:resultRecon,externalReconciliation:external,feeReconciliation:feeRecon,fxAudit,paypalFxFeeAudit:paypal.fxFeeAudit,shopifyAudit:shop.audit,roundingAudit,partialOrderRange:isPartial,warnings,review};
+    return {details:resultDetails,sections:resultSections,summary:resultSummary,reconciliation:resultRecon,externalReconciliation:external,feeReconciliation:feeRecon,fxAudit,paypalFxFeeAudit:paypal.fxFeeAudit,paypalLinkAudit,shopifyAudit:shop.audit,roundingAudit,partialOrderRange:isPartial,warnings,review};
   }
 
   async function testFX(day){

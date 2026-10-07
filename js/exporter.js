@@ -22,7 +22,8 @@
       rows.forEach(r=>out.push(headers.map(h=>(moneyFields.has(h)&&r[h]!==''&&r[h]!=null)?P.round2(r[h]):r[h])));
       const total=new Array(headers.length).fill('');
       total[headers.indexOf('OrderID')>=0?headers.indexOf('OrderID'):0]='TOTAL';
-      headers.forEach((h,i)=>{if(moneyFields.has(h)){const vals=rows.map(r=>Number(r[h])).filter(Number.isFinite);if(vals.length)total[i]=P.round2(vals.reduce((s,v)=>s+v,0));}});
+      headers.forEach((h,i)=>{if(moneyFields.has(h)&&h!=='GrossOriginalCurrency'){ // original-currency amounts are mixed currencies: no meaningful total
+        const vals=rows.map(r=>Number(r[h])).filter(Number.isFinite);if(vals.length)total[i]=P.round2(vals.reduce((s,v)=>s+v,0));}});
       out.push(total); return out;
     };
     return {
@@ -151,6 +152,12 @@
     (items||[]).forEach((r,i)=>rows.push([r.day,r.currency,r.rateDate,r.rate,r.rateSource,r.sourceRows,P.round2(r.feeOriginal),(centsByIndex.get(i)||0)/100,Number(r.feeAUD).toFixed(6),P.round2(r.grossOriginal),P.round2(r.grossAUD)]));
     return rows.map(r=>r.map(csvValue).join(',')).join('\r\n');
   }
+  function paypalLinkAuditCSV(items){
+    const rows=[['Date','OrderID','Billing Country','Gross Payment AUD','Refund AUD','Basis','OriginalCurrency','GrossOriginalCurrency','Note']];
+    (items||[]).forEach(r=>rows.push([r.date,r.order,r.country,P.round2(r.grossAUD),P.round2(r.refundAUD),r.basis,r.currency,r.grossOriginal===''?'':P.round2(r.grossOriginal),r.note]));
+    return rows.map(r=>r.map(csvValue).join(',')).join('\r\n');
+  }
+  function downloadPaypalLink(items,from,to){download(new Blob([paypalLinkAuditCSV(items)],{type:'text/csv;charset=utf-8'}),`PayPal Currency Link Audit${from&&to?` - ${from} - ${to}`:''}.csv`);}
   function downloadPaypalFxFee(items,from,to){download(new Blob([paypalFxFeeCSV(items)],{type:'text/csv;charset=utf-8'}),`PayPal FX Fee Audit${from&&to?` - ${from} - ${to}`:''}.csv`);}
   function downloadFxAudit(entries,from,to){download(new Blob([fxAuditCSV(entries)],{type:'text/csv;charset=utf-8'}),`FX Audit${from&&to?` - ${from} - ${to}`:''}.csv`);}
   function roundingAuditCSV(entries){
@@ -159,5 +166,5 @@
     return lines.map(r=>r.map(csvValue).join(',')).join('\r\n');
   }
   function downloadRoundingAudit(entries,from,to){download(new Blob([roundingAuditCSV(entries)],{type:'text/csv;charset=utf-8'}),`Rounding Audit${from&&to?` - ${from} - ${to}`:''}.csv`);}
-  global.MFExporter={paypalFxFeeCSV,downloadPaypalFxFee,reviewCSV,downloadReview,roundingAuditCSV,downloadRoundingAudit,downloadMerchant,downloadGateway,downloadManualJournal,mainMatrix,detailMatrices,gatewayCSV,manualJournalCSV,manualJournalMatrix,MJ_CONFIG,makeWorkbook,fxAuditCSV,downloadFxAudit};
+  global.MFExporter={paypalLinkAuditCSV,downloadPaypalLink,paypalFxFeeCSV,downloadPaypalFxFee,reviewCSV,downloadReview,roundingAuditCSV,downloadRoundingAudit,downloadMerchant,downloadGateway,downloadManualJournal,mainMatrix,detailMatrices,gatewayCSV,manualJournalCSV,manualJournalMatrix,MJ_CONFIG,makeWorkbook,fxAuditCSV,downloadFxAudit};
 })(window);

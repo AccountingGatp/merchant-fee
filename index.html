@@ -38,14 +38,8 @@
     </section>
 
 
-    <section class="panel">
-      <div class="section-head"><div><h2>PayPal file-only processing</h2>
-        <p>The five standard source files are sufficient for merchant-fee calculation and reconciliation. The PayPal detail sheet keeps the existing columns. Original-currency fields are populated only when a source reference can be matched exactly; otherwise they remain blank rather than being guessed.</p></div></div>
-      <p class="file-meta">No API, extra mapping file, or manual transaction matching is required to process and download the report.</p>
-    </section>
-
     <section class="panel controls-panel">
-      <div>
+      <div class="controls-head">
         <h2>Processing range</h2>
         <p>Optional. Leave blank to use the common date range detected from the reports.</p>
       </div>
@@ -57,12 +51,13 @@
         <label>From Order ID <input id="orderFrom" type="text" inputmode="numeric" placeholder="#10053 (optional)" /></label>
         <label>To Order ID <input id="orderTo" type="text" inputmode="numeric" placeholder="#10342 (optional)" /></label>
       </div>
-      <p class="file-meta">Optional order range: the engine allocates fees across the full period first, validates full-period totals, then exports only orders in the selected range.</p>
-      <div class="fx-test-row">
-        <button class="button secondary" id="testFxBtn" type="button">Check FX API</button>
-        <span id="fxTestStatus" role="status" aria-live="polite" class="file-meta"></span>
+      <p class="file-meta full-row">Optional order range: the engine allocates fees across the full period first, validates full-period totals, then exports only orders in the selected range.</p>
+      <div class="fx-status full-row is-loading" id="fxStatus" role="status" aria-live="polite">
+        <span class="fx-dot" aria-hidden="true"></span>
+        <span class="fx-text" id="fxStatusText">Connecting to the ECB exchange-rate service…</span>
+        <button class="text-button small" id="fxRetryBtn" type="button" hidden>Retry now</button>
       </div>
-      <button class="button primary" id="processBtn" type="button" disabled>Process Merchant Fees</button>
+      <div class="full-row process-row"><button class="button primary" id="processBtn" type="button" disabled>Process Merchant Fees</button></div>
     </section>
 
     <section class="panel hidden" id="resultsPanel">
@@ -94,6 +89,7 @@
         <button class="button secondary" id="downloadJournal" type="button">Download Manual Journal (Xero)</button>
         <button class="button secondary" id="downloadRoundingAudit" type="button">Download Rounding Audit</button>
         <button class="button secondary" id="downloadPaypalFxFee" type="button">Download PayPal FX Fee Audit</button>
+        <button class="button secondary" id="downloadPaypalLink" type="button">Download PayPal Currency Link Audit</button>
         <button class="button secondary" id="downloadReview" type="button">Download Review Issues CSV</button>
         <button class="button secondary" id="downloadFxAudit" type="button">Download FX Audit</button>
       </div>
@@ -101,7 +97,7 @@
   </main>
 
   <dialog id="mappingDialog" class="mapping-dialog">
-    <div class="dialog-head"><div><h2 id="mappingTitle">Map source columns</h2><p class="file-meta">Match the actual CSV headers to the fields used in calculations. Column examples update when you choose a source.</p></div><button type="button" id="closeMapping" class="icon-button" aria-label="Close column mapping">×</button></div>
+    <div class="dialog-head"><div><h2 id="mappingTitle">Map source columns</h2><p class="file-meta" id="mappingIntro">Match the actual CSV headers to the fields used in calculations. Column examples update when you choose a source.</p></div><button type="button" id="closeMapping" class="icon-button" aria-label="Close column mapping">×</button></div>
     <div id="mappingRows" class="mapping-rows"></div>
     <p id="mappingStatus" class="file-meta" role="status"></p>
     <div class="mapping-actions"><button type="button" id="applyMapping" class="button primary">Apply mapping</button><button type="button" id="cancelMapping" class="button secondary">Cancel</button></div>
