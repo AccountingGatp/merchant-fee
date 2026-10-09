@@ -83,26 +83,38 @@
   // Shopify fee amounts in the Payment Transactions export are denominated
   // in EACH ROW'S 'Currency', not necessarily AUD. Exclude other gateways and
   // transaction types; only transactions for Net Payments Shopify orders qualify.
-  async function shopifyFeePool(rows,master,from,to,fx){
+  // Chargeback / dispute fee movements (e.g. "chargeback won" returns the dispute fee
+  // as a NEGATIVE fee) are real Shopify Payments fees for the day, but they belong to
+  // an old order that is not in the day's Net Payments, so they are pooled by date.
+  const isDisputeType=t=>/chargeback|dispute/.test(t);
+  async function shopifyFeePool(rows,master,from,to,fx,bands){
     const eligible=new Set(master.orders.filter(o=>o.kind==='shopify').map(o=>`${o.day}|${o.order}`));
-    const pool={}, audit={excluded:{otherGateway:0,unmatched:0,transactionType:0,zeroFee:0},fx:[]};
+    const pool={}, audit={excluded:{otherGateway:0,unmatched:0,transactionType:0,zeroFee:0},fx:[],disputes:[],excludedFeeTypes:{}};
     for(const r of rows){
       const d=P.parseDate(r['Transaction Date']);if(!inRange(d,from,to))continue;
       const day=P.dateKey(d),order=String(r['Order']||'').trim();
       const type=String(r['Type']||'').trim().toLowerCase().replace(/[_-]/g,' ');
       const method=String(r['Payment Method Name']||'').trim().toLowerCase().replace(/[_-]/g,' ');
+      const dispute=isDisputeType(type);
       // Shop Cash credits and other balance events aren't Shopify Payments charges.
-      if(type==='shop cash credit'||method==='shop cash'){audit.excluded.otherGateway++;continue;}
-      if(type!=='charge'&&type!=='refund'){audit.excluded.transactionType++;continue;}
-      if(!eligible.has(`${day}|${order}`)){audit.excluded.unmatched++;continue;}
+      if(type==='shop cash credit'||method==='shop cash'||(type!=='charge'&&type!=='refund'&&!dispute)){
+        if(type==='shop cash credit'||method==='shop cash')audit.excluded.otherGateway++;else audit.excluded.transactionType++;
+        const f=P.cleanNumber(r['Fee']);
+        if(f){const k=`${String(r['Type']||'(blank)').trim()} ${String(r['Currency']||'').toUpperCase()}`,q=audit.excludedFeeTypes[k]||(audit.excludedFeeTypes[k]={n:0,fee:0});q.n++;q.fee+=f;}
+        continue;
+      }
+      if(!dispute&&!eligible.has(`${day}|${order}`)){audit.excluded.unmatched++;continue;}
       const fee=P.cleanNumber(r['Fee']), gst=P.cleanNumber(r['GST']);
       if(!fee&&!gst){audit.excluded.zeroFee++;continue;}
       const currency=String(r['Currency']||'').trim().toUpperCase();
       if(!/^[A-Z]{3}$/.test(currency))throw new Error(`Shopify transaction ${order} on ${day} has missing or invalid Currency; cannot convert Fee/GST to AUD.`);
-      const info=await fx.getRate(day,currency);
+      // Prefer Shopify's own rate for the day (implied by its AUD order values), falling back to ECB.
+      const band=(bands&&currency!=='AUD')?(bands.byOrder&&bands.byOrder.get(order+'|'+currency)||bands.get(`${currency}|${day}`)):null;
+      const info=band?{rate:(band[0]+band[1])/2,rateDate:day,source:'Shopify implied rate'}:await fx.getRate(day,currency);
       const q=pool[day]||(pool[day]={feeIncl:0,gst:0,feeEx:0,sourceRows:0,currencies:{}});
       q.feeIncl+=fee*info.rate;q.gst+=gst*info.rate;q.feeEx+=(fee-gst)*info.rate;
       q.sourceRows++;q.currencies[currency]=(q.currencies[currency]||0)+1;
+      if(dispute)audit.disputes.push({day,order,type:String(r['Type']||'').trim(),currency,fee,feeAUD:fee*info.rate});
       fx.recordUsage('Shopify',day,currency,info);
     }
     return {pool,audit};
@@ -515,6 +527,7 @@
       else if(cur===pc&&charges.get(order)===1&&audGross.get(order)>0)ratio=audGross.get(order)/pa;
       if(!(ratio>0))continue;
       const k=`${pc}|${P.dateKey(d)}`,b=bands.get(k);
+      if(!bands.byOrder)bands.byOrder=new Map();bands.byOrder.set(order+'|'+pc,[ratio,ratio]);
       if(b){b[0]=Math.min(b[0],ratio);b[1]=Math.max(b[1],ratio);}else bands.set(k,[ratio,ratio]);
     }
     return bands;
@@ -605,7 +618,7 @@
     for(const r of files.transactions.rows){
       const d=P.parseDate(r['Transaction Date']);if(!inRange(d,range.from,range.to))continue;
       const typ=String(r['Type']||'').trim().toLowerCase();
-      if((typ==='charge'||typ==='refund')&&eligible.has(`${P.dateKey(d)}|${String(r['Order']||'').trim()}`)){
+      if(((typ==='charge'||typ==='refund')&&eligible.has(`${P.dateKey(d)}|${String(r['Order']||'').trim()}`))||isDisputeType(typ.replace(/[_-]/g,' '))){
         const c=String(r['Currency']||'').trim().toUpperCase();if(c)currencies.add(c);
       }
     }
@@ -615,14 +628,18 @@
       const c=String(r['Currency']||'').trim().toUpperCase();if(c)currencies.add(c);
     }
     const fx=makeFX(currencies,warnings);
-    const shop=await shopifyFeePool(files.transactions.rows,master,range.from,range.to,fx);
+    const shopBands=shopifyRateBands(files.transactions.rows,master);
+    const shop=await shopifyFeePool(files.transactions.rows,master,range.from,range.to,fx,shopBands);
     const shopPool=shop.pool;
+    if(shop.audit.disputes.length){const tot=shop.audit.disputes.reduce((a,x)=>a+x.feeAUD,0);warnings.push(`Shopify chargeback/dispute fee movements were included in the daily Shopify fee pool: ${shop.audit.disputes.map(x=>`${x.day} ${x.type} ${x.order||''} ${x.currency} ${P.round2(x.fee)}`).join('; ')} (about AUD ${P.round2(tot)} in total; a negative amount is a fee returned by Shopify).`);}
+    const exFeeTypes=Object.entries(shop.audit.excludedFeeTypes);
+    if(exFeeTypes.length)warnings.push('Shopify rows excluded from the fee pool although they carry a fee: '+exFeeTypes.map(([k,q])=>`${k}: ${q.n} row(s), ${P.round2(q.fee)}`).join('; ')+'. Shop Cash credits are not Shopify Payments charges; review any other type.');
     const afterPool=afterpayFeePool(files.afterpay.rows,range.from,range.to);
     const paypal=await paypalSource(files.paypal.rows,range.from,range.to,warnings,fx);
     const roundingAudit=[];
     const details={
       afterpay:buildAfterpayDetails(master,afterPool,range.from,range.to,roundingAudit),
-      paypal:buildPaypalDetails(master,paypal,range.from,range.to,warnings,roundingAudit,{infer:range.inferCurrency!==false,bands:shopifyRateBands(files.transactions.rows,master)}),
+      paypal:buildPaypalDetails(master,paypal,range.from,range.to,warnings,roundingAudit,{infer:range.inferCurrency!==false,bands:shopBands}),
       shopify:buildShopifyDetails(master,shopPool,range.from,range.to,roundingAudit)
     };
     const paypalLinkAudit=details.paypal.linkAudit||[];
