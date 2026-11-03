@@ -607,8 +607,77 @@
     return ['shopify','paypal','afterpay'].map(kind=>{const calc=details[kind].reduce((s,r)=>s+Number(r.GrossAmountAUD||0),0),check=sums[kind]||0,diff=P.round2(calc-check);return {kind,calculated:P.round2(calc),checkpoint:P.round2(check),difference:diff,match:Math.abs(diff)<0.01};});
   }
 
+  // Date coverage of every uploaded report versus the range being processed. The range
+  // normally comes from Net Payments only, so a report that stops early (or runs longer)
+  // would otherwise be cut off silently. Returns human-readable problems; [] = all aligned.
+  const COVERAGE_FIELDS={net:['Net Payments by Order','Day'],sales:['Total Sales by Order','Day'],transactions:['Payment Transactions','Transaction Date'],paypal:['PayPal Activity','Date'],afterpay:['Afterpay Settlements','Settlement Date']};
+  // Slash dates (10/1/2026) are ambiguous: day-first in PayPal/SOP exports, month-first when a
+  // CSV has been opened and re-saved in US-locale Excel. Read as day-first, "10/1" is 10 Jan and
+  // "10/31" is invalid, so a whole month silently collapsed to a single day. The order is now
+  // detected per column from the data (a part > 12 settles it) and, only when every value is
+  // <= 12, from whichever order lines up with the other reports. Values are rewritten as ISO dates.
+  const SLASH=/^\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/;
+  function slashOrder(rows,field){
+    let a12=0,b12=0,n=0;
+    for(const r of rows){const m=SLASH.exec(String(r[field]??''));if(!m)continue;n++;if(+m[1]>12)a12++;if(+m[2]>12)b12++;}
+    if(!n)return null;
+    if(a12&&!b12)return 'dmy';
+    if(b12&&!a12)return 'mdy';
+    if(a12&&b12)return 'mixed';
+    return 'ambiguous';
+  }
+  function slashToIso(v,order){
+    const m=SLASH.exec(String(v??''));if(!m)return v;
+    const day=order==='mdy'?+m[2]:+m[1],mon=order==='mdy'?+m[1]:+m[2],y=+m[3];
+    if(mon<1||mon>12||day<1||day>31)return v;
+    return `${y}-${String(mon).padStart(2,'0')}-${String(day).padStart(2,'0')}${String(v).slice(m[0].length)}`;
+  }
+  function normalizeFileDates(files,warnings){
+    const cols=[];
+    for(const [k,[label,field]] of Object.entries(COVERAGE_FIELDS)){const f=files[k];if(f&&f.rows&&f.rows.length)cols.push({k,label,field,f,order:slashOrder(f.rows,field)});}
+    // reference range from columns that are not ambiguous
+    let lo=null,hi=null;
+    const upd=d=>{if(!d)return;const t=d.getTime();if(lo===null||t<lo)lo=t;if(hi===null||t>hi)hi=t;};
+    for(const c of cols){
+      if(c.order==='ambiguous'||c.order==='mixed')continue;
+      for(const r of c.f.rows){const v=String(r[c.field]??'');upd(SLASH.test(v)?P.parseDate(slashToIso(v,c.order)):P.parseDate(v));}
+    }
+    for(const c of cols){
+      if(!c.order)continue;
+      let order=c.order;
+      if(order==='mixed'){warnings.push(`${c.label}: the "${c.field}" dates mix day-first and month-first values; they were left as day-first. Check this file.`);order='dmy';}
+      if(order==='ambiguous'){
+        order='dmy';
+        if(lo!==null){
+          // share of this file's rows that land inside the other reports' date span (a wrong order scatters
+          // rows across the year, e.g. 5/10/2026 read day-first becomes 5 Oct but 10/5/2026 becomes 10 May)
+          const score=o=>{let inside=0,total=0;for(const r of c.f.rows){const d=P.parseDate(slashToIso(r[c.field],o));total++;if(d&&d.getTime()>=lo-86400000&&d.getTime()<=hi+86400000)inside++;}return total?inside/total:0;};
+          if(score('mdy')>score('dmy'))order='mdy';
+        }
+        warnings.push(`${c.label}: the "${c.field}" dates (e.g. ${String(c.f.rows[0][c.field])}) could be read day-first or month-first; read as ${order==='mdy'?'month/day/year':'day/month/year'} to line up with the other reports.`);
+      }else if(order==='mdy')warnings.push(`${c.label}: the "${c.field}" dates are month/day/year (e.g. ${String(c.f.rows.find(r=>SLASH.test(String(r[c.field]??'')))[c.field])}); they were read that way. This usually means the CSV was re-saved in Excel; re-export it from Shopify if anything looks wrong.`);
+      c.f.rows=c.f.rows.map(r=>{const v=r[c.field];const iso=slashToIso(v,order);if(iso===v)return r;const o={...r};o[c.field]=iso;return o;});
+    }
+    return files;
+  }
+
+  function coverageCheck(files,range){
+    const problems=[],info={};
+    if(!range||!range.from||!range.to)return {problems,info};
+    for(const [k,[label,field]] of Object.entries(COVERAGE_FIELDS)){
+      const f=files[k];if(!f||!f.rows||!f.rows.length)continue;
+      const mm=P.minMaxDates(f.rows,field);if(!mm||!mm.min||!mm.max)continue;
+      const lo=P.dateKey(mm.min),hi=P.dateKey(mm.max);info[k]={label,from:lo,to:hi};
+      if(lo>range.from||hi<range.to)problems.push({short:true,text:`${label} covers only ${lo} to ${hi}, but the range being processed is ${range.from} to ${range.to}; days outside it will show no data for this report.`});
+      else if(k!=='net'&&(lo<range.from||hi>range.to))problems.push({short:false,text:`${label} also has data from ${lo} to ${hi}, outside the range being processed (${range.from} to ${range.to}); those extra days are ignored.`});
+    }
+    return {problems,info};
+  }
+
   async function process(files,range){
     const warnings=[];
+    normalizeFileDates(files,warnings);
+    coverageCheck(files,range).problems.forEach(p=>warnings.push((p.short?'DATE RANGE MISMATCH: ':'Date range note: ')+p.text));
     const master=buildOrderMaster(files.net.rows,range.from,range.to);
     const review=[...master.issues];
     if(master.issues.length)warnings.push(`${master.issues.length} source transaction(s) have no Shopify Order Name. Their amounts remain in the gateway summary, but no invented order rows were created. See Review Issues CSV.`);
@@ -690,5 +759,5 @@
     const [usd,gbp]=await Promise.all([fx.getRate(day,'USD'),fx.getRate(day,'GBP')]);
     return {requestedDate:day,usd,gbp,source:'ECB via Frankfurter'};
   }
-  global.MFEngine={process,gatewayKind,testFX};
+  global.MFEngine={normalizeFileDates,coverageCheck,process,gatewayKind,testFX};
 })(window);
