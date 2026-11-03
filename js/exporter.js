@@ -119,8 +119,24 @@
   }
   function manualJournalCSV(sections,from,to){return manualJournalMatrix(sections,from,to).map(r=>r.map(csvValue).join(',')).join('\r\n');}
 
+
+  // Daily merchant fee total across all gateways (what the Daily Reporting Sheet needs):
+  // Afterpay fee ex GST + PayPal fee (GST-exempt) + Shopify fee ex GST, one row per day.
+  function dailyTotalMatrix(sections){
+    const byKind=Object.fromEntries(sections.map(s=>[s.kind,s.rows])),byDay={};
+    ['afterpay','paypal','shopify'].forEach(kind=>(byKind[kind]||[]).forEach(r=>{(byDay[r.day]=byDay[r.day]||{})[kind]=r;}));
+    const out=[['Date','Afterpay (ex GST)','Paypal','Shopify (ex GST)','Merchant fee total (ex GST)','GST on fees','Merchant fee total (incl GST)']];
+    const tot=[0,0,0,0,0,0];
+    Object.keys(byDay).sort().forEach(day=>{
+      const d=byDay[day],ap=P.round2(d.afterpay?.feeEx||0),pp=P.round2(d.paypal?.fee||0),sp=P.round2(d.shopify?.feeEx||0);
+      const gst=P.round2((d.afterpay?.gst||0)+(d.shopify?.gst||0)),total=P.round2(ap+pp+sp),incl=P.round2(total+gst);
+      out.push([day,ap,pp,sp,total,gst,incl]);[ap,pp,sp,total,gst,incl].forEach((v,i)=>tot[i]+=v);
+    });
+    out.push(['Grand Total',...tot.map(P.round2)]);return out;
+  }
+
   async function downloadMerchant(result,from,to){
-    const details=detailMatrices(result.details),sheets={Main:mainMatrix(result.sections),Afterpay:details.Afterpay,Paypal:details.Paypal,Shopify:details.Shopify};
+    const details=detailMatrices(result.details),sheets={Main:mainMatrix(result.sections),'Merchant Fee Total':dailyTotalMatrix(result.sections),Afterpay:details.Afterpay,Paypal:details.Paypal,Shopify:details.Shopify};
     const blob=await makeWorkbook(sheets);download(blob,`Merchant fee${from&&to?` - ${from} - ${to}`:''}.xlsx`);
   }
   function downloadGateway(summary,from,to){download(new Blob([gatewayCSV(summary)],{type:'text/csv;charset=utf-8'}),`Payments by gateway summary${from&&to?` - ${from} - ${to}`:''}.csv`);}
@@ -166,5 +182,5 @@
     return lines.map(r=>r.map(csvValue).join(',')).join('\r\n');
   }
   function downloadRoundingAudit(entries,from,to){download(new Blob([roundingAuditCSV(entries)],{type:'text/csv;charset=utf-8'}),`Rounding Audit${from&&to?` - ${from} - ${to}`:''}.csv`);}
-  global.MFExporter={paypalLinkAuditCSV,downloadPaypalLink,paypalFxFeeCSV,downloadPaypalFxFee,reviewCSV,downloadReview,roundingAuditCSV,downloadRoundingAudit,downloadMerchant,downloadGateway,downloadManualJournal,mainMatrix,detailMatrices,gatewayCSV,manualJournalCSV,manualJournalMatrix,MJ_CONFIG,makeWorkbook,fxAuditCSV,downloadFxAudit};
+  global.MFExporter={paypalLinkAuditCSV,downloadPaypalLink,paypalFxFeeCSV,downloadPaypalFxFee,reviewCSV,downloadReview,roundingAuditCSV,downloadRoundingAudit,downloadMerchant,downloadGateway,downloadManualJournal,mainMatrix,dailyTotalMatrix,detailMatrices,gatewayCSV,manualJournalCSV,manualJournalMatrix,MJ_CONFIG,makeWorkbook,fxAuditCSV,downloadFxAudit};
 })(window);
